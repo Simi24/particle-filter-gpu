@@ -1,0 +1,22 @@
+{
+	"name": "VS Code Client for Colab SSH",
+	"image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				// --- Pacchetto Fondamentale per C/C++ ---
+				"ms-vscode.cpptools-extension-pack",
+
+				// --- Supporto Specifico per CUDA ---
+				"ms-nvidia.cuda-v2",
+
+				// --- Essenziale per la Connessione Remota ---
+				"ms-vscode-remote.remote-ssh",
+
+				// --- Produttività Generale (Altamente Consigliato) ---
+				"eamodio.gitlens"
+			]
+		}
+	}
+}
