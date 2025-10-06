@@ -157,10 +157,3 @@ void inclusive_scan(
     
     CUDA_CHECK(cudaFree(d_block_sums));
 }
-
-/**
- * In-place version of inclusive scan
- */
-void inclusive_scan_inplace(float* d_data, int n, cudaStream_t stream = 0) {
-    inclusive_scan(d_data, d_data, n, stream);
-}

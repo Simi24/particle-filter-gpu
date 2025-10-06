@@ -214,60 +214,6 @@ __global__ void normalize_weights_kernel(
     cumulative_weights[idx] *= norm_factor;
 }
 
-/* =================================================== */
-/* SYSTEMATIC RESAMPLING                               */
-/* =================================================== */
-
-/**
- * Performs systematic resampling using binary search
- * Optimized version with:
- * - Coalesced memory access for input particles
- * - Efficient binary search (avoids linear search divergence)
- * - Strided writes to avoid bank conflicts
- * 
- * @param particles_in: Input particles (to be resampled)
- * @param particles_out: Output resampled particles
- * @param cumulative_weights: Normalized cumulative weights
- * @param n: Number of particles
- * @param random_offset: Random offset for systematic resampling
- */
-__global__ void resample_kernel(
-    const Particle* __restrict__ particles_in,
-    Particle* __restrict__ particles_out,
-    const float* __restrict__ cumulative_weights,
-    int n,
-    float random_offset
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (idx >= n) return;
-    
-    // Compute systematic sample position
-    float position = random_offset + (float)idx / n;
-    
-    // Binary search for the particle to resample
-    // This is much more efficient than linear search for large N
-    int left = 0;
-    int right = n - 1;
-    int selected_idx = 0;
-    
-    // Unrolled binary search for better performance
-    #pragma unroll 8
-    while (left <= right) {
-        int mid = (left + right) >> 1;
-        float cum_weight = cumulative_weights[mid];
-        
-        if (cum_weight < position) {
-            left = mid + 1;
-        } else {
-            selected_idx = mid;
-            right = mid - 1;
-        }
-    }
-    
-    // Copy selected particle to output (coalesced write)
-    particles_out[idx] = particles_in[selected_idx];
-}
 
 /* =================================================== */
 /* OPTIMIZED RESAMPLING WITH SHARED MEMORY             */

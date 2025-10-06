@@ -67,45 +67,7 @@ void write_result(FILE* file, const Result* result) {
             result->error);
 }
 
-/**
- * Writes particle data to CSV file (for visualization)
- */
-void write_particles(
-    FILE* file,
-    int timestep,
-    const Particle* h_particles,
-    const float* h_weights,
-    int n_particles
-) {
-    for (int i = 0; i < n_particles; ++i) {
-        fprintf(file, "%d,%f,%f,%f\n",
-                timestep,
-                h_particles[i].x,
-                h_particles[i].y,
-                h_weights[i]);
-    }
-}
 
-/* =================================================== */
-/* MEMORY ALLOCATION UTILITIES                         */
-/* =================================================== */
-
-/**
- * Allocates pinned (page-locked) host memory for faster transfers
- * Pinned memory allows asynchronous copies and higher bandwidth
- */
-void* allocate_pinned_memory(size_t size) {
-    void* ptr;
-    CUDA_CHECK(cudaMallocHost(&ptr, size));
-    return ptr;
-}
-
-/**
- * Frees pinned host memory
- */
-void free_pinned_memory(void* ptr) {
-    CUDA_CHECK(cudaFreeHost(ptr));
-}
 
 /* =================================================== */
 /* DEVICE INFORMATION                                  */
@@ -140,29 +102,12 @@ void print_device_info() {
 /* =================================================== */
 
 /**
- * Simple timer structure for CPU timing
- */
-typedef struct {
-    clock_t start;
-    clock_t end;
-} CPUTimer;
-
-/**
  * GPU timer using CUDA events
  */
 typedef struct {
     cudaEvent_t start;
     cudaEvent_t stop;
 } GPUTimer;
-
-void cpu_timer_start(CPUTimer* timer) {
-    timer->start = clock();
-}
-
-float cpu_timer_stop(CPUTimer* timer) {
-    timer->end = clock();
-    return ((float)(timer->end - timer->start)) / CLOCKS_PER_SEC;
-}
 
 void gpu_timer_create(GPUTimer* timer) {
     CUDA_CHECK(cudaEventCreate(&timer->start));
@@ -176,7 +121,7 @@ void gpu_timer_start(GPUTimer* timer) {
 float gpu_timer_stop(GPUTimer* timer) {
     CUDA_CHECK(cudaEventRecord(timer->stop));
     CUDA_CHECK(cudaEventSynchronize(timer->stop));
-    
+
     float milliseconds = 0;
     CUDA_CHECK(cudaEventElapsedTime(&milliseconds, timer->start, timer->stop));
     return milliseconds / 1000.0f; // Convert to seconds

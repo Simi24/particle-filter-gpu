@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include <string.h>
 
 #include "particle_filter_config.h"
 
@@ -19,8 +18,7 @@ typedef struct {
 extern void inclusive_scan(const float*, float*, int, cudaStream_t);
 extern float reduce_sum(const float*, int, cudaStream_t);
 extern float reduce_sum_squares(const float*, int, cudaStream_t);
-extern void weighted_average(const Particle*, const float*, int, float*, float*, cudaStream_t);
-extern void debug_simple_average(const Particle*, int, float*, float*, cudaStream_t);
+extern void weighted_average(const Particle*, const float*, int, float*, float*, float*, float*, cudaStream_t);
 
 // Forward declarations for kernel launches
 extern "C" {
@@ -28,7 +26,6 @@ extern "C" {
     __global__ void predict_kernel(Particle*, curandState*, int);
     __global__ void update_weights_kernel(const Particle*, float*, int, float, float);
     __global__ void normalize_weights_kernel(float*, float*, int, float);
-    __global__ void resample_kernel(const Particle*, Particle*, const float*, int, float);
     __global__ void resample_optimized_kernel(const Particle*, Particle*, cudaTextureObject_t, int, float);
     __global__ void set_uniform_weights_kernel(float*, int, float);
 }

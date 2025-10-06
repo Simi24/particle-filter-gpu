@@ -140,18 +140,4 @@ typedef struct {
 /* INLINE DEVICE FUNCTIONS                             */
 /* =================================================== */
 
-// Fast square function
-__device__ __forceinline__ float square(float x) {
-    return x * x;
-}
-
-// Warp-level reduction using shuffle instructions (no shared memory)
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
-    return val;
-}
-
 #endif // PARTICLE_FILTER_CONFIG_H
