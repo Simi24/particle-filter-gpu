@@ -46,6 +46,7 @@ extern float compute_rmse(const float*, int);
 extern float compute_mean(const float*, int);
 extern float compute_stddev(const float*, int, float);
 
+
 // Trajectory generation (also in kernels file)
 extern void generate_trajectory(float, float*, float*);
 
@@ -77,6 +78,12 @@ typedef struct {
     // Grid configuration
     int threads_per_block;
     int blocks_per_grid;
+
+    // Profiling data
+#if ENABLE_PROFILING
+    ProfilingData profiling;
+    GPUTimer kernel_timers[10];  // Timers for different kernels
+#endif
 } ParticleFilterState;
 
 /* =================================================== */
@@ -118,7 +125,17 @@ void initialize_particle_filter(ParticleFilterState* pf, int n_particles) {
     for (int i = 0; i < NUM_STREAMS; ++i) {
         CUDA_CHECK(cudaStreamCreate(&pf->streams[i]));
     }
-    
+
+#if ENABLE_PROFILING
+    // Initialize profiling data
+    memset(&pf->profiling, 0, sizeof(ProfilingData));
+
+    // Create kernel timers
+    for (int i = 0; i < 10; ++i) {
+        gpu_timer_create(&pf->kernel_timers[i]);
+    }
+#endif
+
     printf("Memory allocated successfully\n");
     printf("Total GPU memory used: %.2f MB\n",
            (2 * particle_size + 2 * float_size + state_size) / (1024.0 * 1024.0));
@@ -198,11 +215,13 @@ Result particle_filter_step(
     cudaStream_t resample_stream = pf->streams[3];
     
     // ============ PREDICTION STEP ============
+    PROFILE_KERNEL_START(&pf->kernel_timers[0]);
     predict_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, predict_stream>>>(
         d_particles_curr,
         pf->d_rand_states,
         pf->n_particles
     );
+    PROFILE_KERNEL_END(&pf->kernel_timers[0], pf->profiling.prediction_time);
 
     // Wait for prediction to complete before weight update (data dependency)
     CUDA_CHECK(cudaStreamSynchronize(predict_stream));
@@ -220,6 +239,7 @@ Result particle_filter_step(
     }
     
     // ============ UPDATE WEIGHTS ============
+    PROFILE_KERNEL_START(&pf->kernel_timers[1]);
     update_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, weight_stream>>>(
         d_particles_curr,
         pf->d_weights,
@@ -227,21 +247,25 @@ Result particle_filter_step(
         obs_x,
         obs_y
     );
+    PROFILE_KERNEL_END(&pf->kernel_timers[1], pf->profiling.weight_update_time);
     
     // ============ COMPUTE CUMULATIVE WEIGHTS ============
     // Wait for weight update to complete before scan
     CUDA_CHECK(cudaStreamSynchronize(weight_stream));
 
     // Perform inclusive scan (prefix sum) on weights
+    PROFILE_KERNEL_START(&pf->kernel_timers[2]);
     inclusive_scan(
         pf->d_weights,
         pf->d_cumulative_weights,
         pf->n_particles,
         scan_stream
     );
+    PROFILE_KERNEL_END(&pf->kernel_timers[2], pf->profiling.scan_time);
 
     // Get total weight (last element of cumulative sum)
     float total_weight;
+    PROFILE_KERNEL_START(&pf->kernel_timers[8]);
     CUDA_CHECK(cudaMemcpyAsync(
         &total_weight,
         pf->d_cumulative_weights + pf->n_particles - 1,
@@ -250,22 +274,27 @@ Result particle_filter_step(
         scan_stream
     ));
     CUDA_CHECK(cudaStreamSynchronize(scan_stream));
+    PROFILE_KERNEL_END(&pf->kernel_timers[8], pf->profiling.memory_transfer_time);
     
     // ============ NORMALIZE WEIGHTS ============
+    PROFILE_KERNEL_START(&pf->kernel_timers[3]);
     normalize_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, scan_stream>>>(
         pf->d_weights,
         pf->d_cumulative_weights,
         pf->n_particles,
         total_weight
     );
+    PROFILE_KERNEL_END(&pf->kernel_timers[3], pf->profiling.normalize_time);
     
     // ============ COMPUTE ESS (Effective Sample Size) ============
     // Can overlap with state estimation
+    PROFILE_KERNEL_START(&pf->kernel_timers[4]);
     float sum_weights_squared = reduce_sum_squares(
         pf->d_weights,
         pf->n_particles,
         scan_stream
     );
+    PROFILE_KERNEL_END(&pf->kernel_timers[4], pf->profiling.scan_time); // Add to scan time
     float ess = 1.0f / sum_weights_squared;
     
     // ============ RESAMPLING (if needed) ============
@@ -291,6 +320,7 @@ Result particle_filter_step(
         float random_offset = ((float)rand() / RAND_MAX) / pf->n_particles;
 
         // Use optimized resampling kernel with shared memory
+        PROFILE_KERNEL_START(&pf->kernel_timers[6]);
         resample_optimized_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, resample_stream>>>(
             d_particles_curr,
             d_particles_next,
@@ -298,6 +328,8 @@ Result particle_filter_step(
             pf->n_particles,
             random_offset
         );
+        PROFILE_KERNEL_END(&pf->kernel_timers[6], pf->profiling.resample_time);
+        pf->profiling.resample_count++;
 
         // Destroy texture object
         CUDA_CHECK(cudaDestroyTextureObject(pf->tex_weights_obj));
@@ -307,9 +339,11 @@ Result particle_filter_step(
 
         // Reset weights to uniform after resampling
         float uniform_weight = 1.0f / pf->n_particles;
+        PROFILE_KERNEL_START(&pf->kernel_timers[7]);
         set_uniform_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, resample_stream>>>(
             pf->d_weights, pf->n_particles, uniform_weight
         );
+        PROFILE_KERNEL_END(&pf->kernel_timers[7], pf->profiling.resample_time); // Add to resample time
     }
     
     // ============ STATE ESTIMATION ============
@@ -317,14 +351,18 @@ Result particle_filter_step(
 
     // Use proper weighted average for state estimation
     // Can overlap with ESS calculation and resampling decision
+    PROFILE_KERNEL_START(&pf->kernel_timers[5]);
     weighted_average(
         pf->d_particles[pf->current_buffer],
         pf->d_weights,
         pf->n_particles,
         &est_x,
         &est_y,
+        pf->h_est_x_pinned,
+        pf->h_est_y_pinned,
         resample_stream
     );
+    PROFILE_KERNEL_END(&pf->kernel_timers[5], pf->profiling.state_estimation_time);
     
     // ============ COMPUTE ERROR ============
     float dx = est_x - true_x;
@@ -365,7 +403,76 @@ void cleanup_particle_filter(ParticleFilterState* pf) {
     for (int i = 0; i < NUM_STREAMS; ++i) {
         CUDA_CHECK(cudaStreamDestroy(pf->streams[i]));
     }
+
+#if ENABLE_PROFILING
+    // Destroy kernel timers
+    for (int i = 0; i < 10; ++i) {
+        gpu_timer_destroy(&pf->kernel_timers[i]);
+    }
+#endif
 }
+
+#if ENABLE_PROFILING
+/**
+ * Print detailed profiling information
+ */
+void print_profiling_results(ParticleFilterState* pf, int n_timesteps, float total_simulation_time) {
+    printf("\n");
+    printf("================================================================================\n");
+    printf("  DETAILED PERFORMANCE PROFILING RESULTS\n");
+    printf("================================================================================\n");
+
+    // Calculate totals
+    float total_kernel_time = pf->profiling.prediction_time +
+                             pf->profiling.weight_update_time +
+                             pf->profiling.scan_time +
+                             pf->profiling.normalize_time +
+                             pf->profiling.resample_time +
+                             pf->profiling.state_estimation_time;
+
+    pf->profiling.total_kernel_time = total_kernel_time;
+
+    // Per-timestep averages
+    float avg_prediction = pf->profiling.prediction_time / n_timesteps;
+    float avg_weight_update = pf->profiling.weight_update_time / n_timesteps;
+    float avg_scan = pf->profiling.scan_time / n_timesteps;
+    float avg_normalize = pf->profiling.normalize_time / n_timesteps;
+    float avg_resample = pf->profiling.resample_time / n_timesteps;
+    float avg_state_est = pf->profiling.state_estimation_time / n_timesteps;
+    float avg_memory = pf->profiling.memory_transfer_time / n_timesteps;
+
+    printf("Per-Timestep Kernel Execution Times (milliseconds):\n");
+    printf("  Prediction:       %.4f ms\n", avg_prediction * 1000.0f);
+    printf("  Weight Update:    %.4f ms\n", avg_weight_update * 1000.0f);
+    printf("  Scan:            %.4f ms\n", avg_scan * 1000.0f);
+    printf("  Normalize:       %.4f ms\n", avg_normalize * 1000.0f);
+    printf("  Resample:        %.4f ms\n", avg_resample * 1000.0f);
+    printf("  State Estimation: %.4f ms\n", avg_state_est * 1000.0f);
+    printf("  Memory Transfer:  %.4f ms\n", avg_memory * 1000.0f);
+
+    printf("\nTotal Kernel Time Breakdown:\n");
+    printf("  Prediction:       %.2f%%\n", (pf->profiling.prediction_time / total_kernel_time) * 100.0f);
+    printf("  Weight Update:    %.2f%%\n", (pf->profiling.weight_update_time / total_kernel_time) * 100.0f);
+    printf("  Scan:            %.2f%%\n", (pf->profiling.scan_time / total_kernel_time) * 100.0f);
+    printf("  Normalize:       %.2f%%\n", (pf->profiling.normalize_time / total_kernel_time) * 100.0f);
+    printf("  Resample:        %.2f%%\n", (pf->profiling.resample_time / total_kernel_time) * 100.0f);
+    printf("  State Estimation: %.2f%%\n", (pf->profiling.state_estimation_time / total_kernel_time) * 100.0f);
+
+    printf("\nPerformance Metrics:\n");
+    printf("  Total Simulation Time: %.3f seconds\n", total_simulation_time);
+    printf("  Total Kernel Time:     %.3f seconds\n", total_kernel_time);
+    printf("  Average Time per Step: %.4f ms\n", (total_simulation_time * 1000.0f) / n_timesteps);
+    printf("  Throughput:            %.1f particles/ms\n", (pf->n_particles * n_timesteps) / (total_simulation_time * 1000.0f));
+    printf("  Resampling Frequency:  %.2f%%\n", (float)pf->profiling.resample_count / n_timesteps * 100.0f);
+
+    // Calculate theoretical bandwidth if possible
+    size_t bytes_processed = n_timesteps * pf->n_particles * (sizeof(Particle) + 2 * sizeof(float));
+    float bandwidth_gb_s = bytes_processed / (total_kernel_time * 1024.0 * 1024.0 * 1024.0);
+    printf("  Memory Bandwidth:      %.2f GB/s\n", bandwidth_gb_s);
+
+    printf("================================================================================\n");
+}
+#endif
 
 /* =================================================== */
 /* MAIN PROGRAM                                        */
@@ -465,7 +572,12 @@ int main(int argc, char** argv) {
     printf("RMSE: %.3f\n", rmse);
     printf("Standard deviation: %.3f\n", stddev);
     printf("Final error: %.3f\n", errors[N_TIMESTEPS - 1]);
-    
+
+#if ENABLE_PROFILING
+    // Print detailed profiling results
+    print_profiling_results(&pf, N_TIMESTEPS, total_time);
+#endif
+
     // Cleanup
     cleanup_particle_filter(&pf);
     fclose(results_file);

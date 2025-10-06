@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
+
 /* =================================================== */
 /* SIMULATION PARAMETERS                               */
 /* =================================================== */
@@ -16,6 +17,11 @@
 #define PROCESS_NOISE    0.3f
 #define MEASUREMENT_NOISE 1.0f
 #define INIT_NOISE       0.5f
+
+/* =================================================== */
+/* PROFILING CONFIGURATION                             */
+/* =================================================== */
+#define ENABLE_PROFILING 1  // Set to 1 to enable detailed profiling
 
 /* =================================================== */
 /* CONSTANT MEMORY DECLARATIONS                        */
@@ -82,6 +88,53 @@ typedef struct {
     float est_x, est_y;
     float error;
 } Result;
+
+/* =================================================== */
+/* PROFILING STRUCTURES AND MACROS                     */
+/* =================================================== */
+
+#if ENABLE_PROFILING
+typedef struct {
+    float prediction_time;
+    float weight_update_time;
+    float scan_time;
+    float normalize_time;
+    float resample_time;
+    float state_estimation_time;
+    float memory_transfer_time;
+    float total_kernel_time;
+    int resample_count;
+} ProfilingData;
+
+#define PROFILE_RANGE_START(name)
+#define PROFILE_RANGE_END()
+
+#define PROFILE_KERNEL_START(timer) \
+    do { \
+        if (ENABLE_PROFILING) { \
+            gpu_timer_start(timer); \
+        } \
+        PROFILE_RANGE_START(__FUNCTION__); \
+    } while(0)
+
+#define PROFILE_KERNEL_END(timer, time_var) \
+    do { \
+        PROFILE_RANGE_END(); \
+        if (ENABLE_PROFILING) { \
+            time_var += gpu_timer_stop(timer); \
+        } \
+    } while(0)
+
+#else
+typedef struct {
+    float dummy; // Empty struct when profiling disabled
+} ProfilingData;
+
+#define PROFILE_RANGE_START(name)
+#define PROFILE_RANGE_END()
+#define PROFILE_KERNEL_START(timer)
+#define PROFILE_KERNEL_END(timer, time_var)
+#endif
 
 /* =================================================== */
 /* INLINE DEVICE FUNCTIONS                             */

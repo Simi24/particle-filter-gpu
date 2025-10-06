@@ -286,6 +286,7 @@ __global__ void weighted_reduce_kernel(
 
 /**
  * Computes weighted average of particle positions
+ * Uses pinned memory for asynchronous transfers
  * Returns result through output parameters
  */
 void weighted_average(
@@ -294,52 +295,60 @@ void weighted_average(
     int n,
     float* est_x,
     float* est_y,
+    float* pinned_x,
+    float* pinned_y,
     cudaStream_t stream = 0
 ) {
     int threads = REDUCTION_THREADS;
     int blocks = min(256, GRID_SIZE(n, threads * 2));
-    
+
     float *d_block_x, *d_block_y;
     CUDA_CHECK(cudaMalloc(&d_block_x, blocks * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_block_y, blocks * sizeof(float)));
-    
+
     weighted_reduce_kernel<<<blocks, threads, 0, stream>>>(
         d_particles, d_weights, n, d_block_x, d_block_y
     );
-    
+
     if (blocks == 1) {
-        CUDA_CHECK(cudaMemcpyAsync(est_x, d_block_x, sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(pinned_x, d_block_x, sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(est_y, d_block_y, sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(pinned_y, d_block_y, sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        *est_x = *pinned_x;
+        *est_y = *pinned_y;
     } else {
         // Perform final reduction on the block results
         float *d_final_x, *d_final_y;
         CUDA_CHECK(cudaMalloc(&d_final_x, sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_final_y, sizeof(float)));
-        
+
         // Final reduction for x
         reduce_kernel<float, SumOp><<<1, threads, threads * sizeof(float), stream>>>(
             d_block_x, d_final_x, blocks, 0.0f
         );
-        
-        // Final reduction for y  
+
+        // Final reduction for y
         reduce_kernel<float, SumOp><<<1, threads, threads * sizeof(float), stream>>>(
             d_block_y, d_final_y, blocks, 0.0f
         );
-        
-        // Copy results back to host
-        CUDA_CHECK(cudaMemcpyAsync(est_x, d_final_x, sizeof(float),
+
+        // Copy results back to pinned memory
+        CUDA_CHECK(cudaMemcpyAsync(pinned_x, d_final_x, sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(est_y, d_final_y, sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(pinned_y, d_final_y, sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        
+
+        // Copy from pinned to output
+        *est_x = *pinned_x;
+        *est_y = *pinned_y;
+
         CUDA_CHECK(cudaFree(d_final_x));
         CUDA_CHECK(cudaFree(d_final_y));
     }
-    
+
     CUDA_CHECK(cudaFree(d_block_x));
     CUDA_CHECK(cudaFree(d_block_y));
 }
