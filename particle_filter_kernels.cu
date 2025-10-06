@@ -111,30 +111,28 @@ __global__ void init_particles_kernel(
 __global__ void predict_kernel(
     Particle* __restrict__ particles,
     curandState* __restrict__ rand_states,
-    int n,
-    float dt,
-    float process_noise
+    int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     if (idx >= n) return;
-    
+
     // Load random state to local memory for efficiency
     curandState local_state = rand_states[idx];
-    
+
     // Load particle to registers
     Particle p = particles[idx];
-    
-    // Constant velocity model with Gaussian noise
-    float noise_scale = process_noise * dt;
-    p.x += p.vx * dt + curand_normal(&local_state) * noise_scale;
-    p.y += p.vy * dt + curand_normal(&local_state) * noise_scale;
-    
+
+    // Constant velocity model with Gaussian noise (using constant memory)
+    float noise_scale = c_process_noise * c_dt;
+    p.x += p.vx * c_dt + curand_normal(&local_state) * noise_scale;
+    p.y += p.vy * c_dt + curand_normal(&local_state) * noise_scale;
+
     // Velocity random walk
-    float vel_noise_scale = process_noise * 0.2f * dt;
+    float vel_noise_scale = c_process_noise * 0.2f * c_dt;
     p.vx += curand_normal(&local_state) * vel_noise_scale;
     p.vy += curand_normal(&local_state) * vel_noise_scale;
-    
+
     // Write back to global memory
     particles[idx] = p;
     rand_states[idx] = local_state;
@@ -162,26 +160,25 @@ __global__ void update_weights_kernel(
     float* __restrict__ weights,
     int n,
     float obs_x,
-    float obs_y,
-    float measurement_noise
+    float obs_y
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     if (idx >= n) return;
-    
+
     // Load particle position to registers
     float px = particles[idx].x;
     float py = particles[idx].y;
-    
+
     // Compute squared distance to observation
     float dx = px - obs_x;
     float dy = py - obs_y;
     float dist_sq = dx * dx + dy * dy;
-    
-    // Gaussian likelihood with small epsilon to avoid zero weights
-    float variance = measurement_noise * measurement_noise;
+
+    // Gaussian likelihood with small epsilon to avoid zero weights (using constant memory)
+    float variance = c_measurement_noise * c_measurement_noise;
     float likelihood = __expf(-dist_sq / (2.0f * variance)) + 1e-10f;
-    
+
     // Store weight
     weights[idx] = likelihood;
 }
@@ -286,7 +283,7 @@ __global__ void resample_kernel(
 __global__ void resample_optimized_kernel(
     const Particle* __restrict__ particles_in,
     Particle* __restrict__ particles_out,
-    const float* __restrict__ cumulative_weights,
+    cudaTextureObject_t tex_weights_obj,
     int n,
     float random_offset
 ) {
@@ -304,40 +301,40 @@ __global__ void resample_optimized_kernel(
     // Each block loads a window of cumulative weights
     int block_start = blockIdx.x * blockDim.x;
     if (tid < blockDim.x && block_start + tid < n) {
-        s_cum_weights[tid] = cumulative_weights[block_start + tid];
+        s_cum_weights[tid] = tex1Dfetch<float>(tex_weights_obj, block_start + tid);
     }
     if (tid == 0 && block_start + blockDim.x < n) {
-        s_cum_weights[blockDim.x] = cumulative_weights[block_start + blockDim.x];
+        s_cum_weights[blockDim.x] = tex1Dfetch<float>(tex_weights_obj, block_start + blockDim.x);
     }
     __syncthreads();
     
     // Fast path: check if position is in current block's range
     int selected_idx;
-    if (block_start > 0 && position < cumulative_weights[block_start - 1]) {
+    if (block_start > 0 && position < tex1Dfetch<float>(tex_weights_obj, block_start - 1)) {
         // Need to search in previous blocks - use binary search on global memory
         int left = 0;
         int right = block_start - 1;
         selected_idx = 0;
-        
+
         while (left <= right) {
             int mid = (left + right) >> 1;
-            if (cumulative_weights[mid] < position) {
+            if (tex1Dfetch<float>(tex_weights_obj, mid) < position) {
                 left = mid + 1;
             } else {
                 selected_idx = mid;
                 right = mid - 1;
             }
         }
-    } else if (block_start + blockDim.x < n && 
+    } else if (block_start + blockDim.x < n &&
                position >= s_cum_weights[blockDim.x - 1]) {
         // Need to search in later blocks
         int left = block_start + blockDim.x;
         int right = n - 1;
         selected_idx = left;
-        
+
         while (left <= right) {
             int mid = (left + right) >> 1;
-            if (cumulative_weights[mid] < position) {
+            if (tex1Dfetch<float>(tex_weights_obj, mid) < position) {
                 left = mid + 1;
             } else {
                 selected_idx = mid;

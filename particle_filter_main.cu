@@ -25,11 +25,11 @@ extern void debug_simple_average(const Particle*, int, float*, float*, cudaStrea
 // Forward declarations for kernel launches
 extern "C" {
     __global__ void init_particles_kernel(Particle*, curandState*, int, float, float);
-    __global__ void predict_kernel(Particle*, curandState*, int, float, float);
-    __global__ void update_weights_kernel(const Particle*, float*, int, float, float, float);
+    __global__ void predict_kernel(Particle*, curandState*, int);
+    __global__ void update_weights_kernel(const Particle*, float*, int, float, float);
     __global__ void normalize_weights_kernel(float*, float*, int, float);
     __global__ void resample_kernel(const Particle*, Particle*, const float*, int, float);
-    __global__ void resample_optimized_kernel(const Particle*, Particle*, const float*, int, float);
+    __global__ void resample_optimized_kernel(const Particle*, Particle*, cudaTextureObject_t, int, float);
     __global__ void set_uniform_weights_kernel(float*, int, float);
 }
 
@@ -59,18 +59,21 @@ typedef struct {
     float* d_weights;
     float* d_cumulative_weights;
     curandState* d_rand_states;
-    
+
+    // Texture object for weights
+    cudaTextureObject_t tex_weights_obj;
+
     // Pinned host memory for async transfers
     float* h_est_x_pinned;
     float* h_est_y_pinned;
-    
+
     // CUDA streams for concurrent execution
     cudaStream_t streams[NUM_STREAMS];
-    
+
     // Configuration
     int n_particles;
     int current_buffer;
-    
+
     // Grid configuration
     int threads_per_block;
     int blocks_per_grid;
@@ -187,20 +190,22 @@ Result particle_filter_step(
     int curr_buf = pf->current_buffer;
     Particle* d_particles_curr = pf->d_particles[curr_buf];
     Particle* d_particles_next = pf->d_particles[1 - curr_buf];
-    
-    cudaStream_t main_stream = pf->streams[0];
+
+    // Assign streams for different phases
+    cudaStream_t predict_stream = pf->streams[0];
+    cudaStream_t weight_stream = pf->streams[1];
+    cudaStream_t scan_stream = pf->streams[2];
+    cudaStream_t resample_stream = pf->streams[3];
     
     // ============ PREDICTION STEP ============
-    predict_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, main_stream>>>(
+    predict_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, predict_stream>>>(
         d_particles_curr,
         pf->d_rand_states,
-        pf->n_particles,
-        DT,
-        PROCESS_NOISE
+        pf->n_particles
     );
-    
-    // Ensure prediction completes before weight update
-    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+
+    // Wait for prediction to complete before weight update (data dependency)
+    CUDA_CHECK(cudaStreamSynchronize(predict_stream));
     
     // Debug: Check particles after prediction (only for first timestep)
     if (time < 0.01f) {  // Only for t=0
@@ -215,24 +220,26 @@ Result particle_filter_step(
     }
     
     // ============ UPDATE WEIGHTS ============
-    update_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, main_stream>>>(
+    update_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, weight_stream>>>(
         d_particles_curr,
         pf->d_weights,
         pf->n_particles,
         obs_x,
-        obs_y,
-        MEASUREMENT_NOISE
+        obs_y
     );
     
     // ============ COMPUTE CUMULATIVE WEIGHTS ============
+    // Wait for weight update to complete before scan
+    CUDA_CHECK(cudaStreamSynchronize(weight_stream));
+
     // Perform inclusive scan (prefix sum) on weights
     inclusive_scan(
         pf->d_weights,
         pf->d_cumulative_weights,
         pf->n_particles,
-        main_stream
+        scan_stream
     );
-    
+
     // Get total weight (last element of cumulative sum)
     float total_weight;
     CUDA_CHECK(cudaMemcpyAsync(
@@ -240,12 +247,12 @@ Result particle_filter_step(
         pf->d_cumulative_weights + pf->n_particles - 1,
         sizeof(float),
         cudaMemcpyDeviceToHost,
-        main_stream
+        scan_stream
     ));
-    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+    CUDA_CHECK(cudaStreamSynchronize(scan_stream));
     
     // ============ NORMALIZE WEIGHTS ============
-    normalize_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, main_stream>>>(
+    normalize_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, scan_stream>>>(
         pf->d_weights,
         pf->d_cumulative_weights,
         pf->n_particles,
@@ -253,49 +260,70 @@ Result particle_filter_step(
     );
     
     // ============ COMPUTE ESS (Effective Sample Size) ============
+    // Can overlap with state estimation
     float sum_weights_squared = reduce_sum_squares(
         pf->d_weights,
         pf->n_particles,
-        main_stream
+        scan_stream
     );
     float ess = 1.0f / sum_weights_squared;
     
     // ============ RESAMPLING (if needed) ============
     float ess_threshold = pf->n_particles / 2.0f;
     if (ess < ess_threshold) {
+        // Wait for normalization to complete before resampling
+        CUDA_CHECK(cudaStreamSynchronize(scan_stream));
+
+        // Create texture object for weight access
+        cudaResourceDesc resDesc = {};
+        resDesc.resType = cudaResourceTypeLinear;
+        resDesc.res.linear.devPtr = pf->d_cumulative_weights;
+        resDesc.res.linear.desc.f = cudaChannelFormatKindFloat;
+        resDesc.res.linear.desc.x = 32; // bits per channel
+        resDesc.res.linear.sizeInBytes = pf->n_particles * sizeof(float);
+
+        cudaTextureDesc texDesc = {};
+        texDesc.readMode = cudaReadModeElementType;
+
+        CUDA_CHECK(cudaCreateTextureObject(&pf->tex_weights_obj, &resDesc, &texDesc, NULL));
+
         // Generate random offset for systematic resampling
         float random_offset = ((float)rand() / RAND_MAX) / pf->n_particles;
-        
+
         // Use optimized resampling kernel with shared memory
-        resample_optimized_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, main_stream>>>(
+        resample_optimized_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, resample_stream>>>(
             d_particles_curr,
             d_particles_next,
-            pf->d_cumulative_weights,
+            pf->tex_weights_obj,
             pf->n_particles,
             random_offset
         );
-        
+
+        // Destroy texture object
+        CUDA_CHECK(cudaDestroyTextureObject(pf->tex_weights_obj));
+
         // Swap buffers
         pf->current_buffer = 1 - curr_buf;
-        
+
         // Reset weights to uniform after resampling
         float uniform_weight = 1.0f / pf->n_particles;
-        set_uniform_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, main_stream>>>(
+        set_uniform_weights_kernel<<<pf->blocks_per_grid, pf->threads_per_block, 0, resample_stream>>>(
             pf->d_weights, pf->n_particles, uniform_weight
         );
     }
     
     // ============ STATE ESTIMATION ============
     float est_x = -999.0f, est_y = -999.0f;  // Initialize to obvious wrong values to detect bugs
-    
+
     // Use proper weighted average for state estimation
+    // Can overlap with ESS calculation and resampling decision
     weighted_average(
         pf->d_particles[pf->current_buffer],
         pf->d_weights,
         pf->n_particles,
         &est_x,
         &est_y,
-        main_stream
+        resample_stream
     );
     
     // ============ COMPUTE ERROR ============

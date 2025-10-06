@@ -5,18 +5,19 @@
 	"customizations": {
 		"vscode": {
 			"extensions": [
-				// --- Pacchetto Fondamentale per C/C++ ---
 				"ms-vscode.cpptools-extension-pack",
-
-				// --- Supporto Specifico per CUDA ---
 				"ms-nvidia.cuda-v2",
-
-				// --- Essenziale per la Connessione Remota ---
 				"ms-vscode-remote.remote-ssh",
-
-				// --- Produttività Generale (Altamente Consigliato) ---
-				"eamodio.gitlens"
+				"eamodio.gitlens",
+				"rooveterinaryinc.roo-cline"
 			]
 		}
-	}
+	},
+	"mounts": [
+		"source=${localEnv:HOME}/roo-code_configs/.roo,target=/workspace/.roo,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/roo-code_configs/.roomodes,target=/workspace/.roomodes,type=bind,consistency=cached"
+	],
+	"remoteUser": "vscode",
+	"workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+	"workspaceFolder": "/workspace"
 }

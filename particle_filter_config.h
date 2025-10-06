@@ -10,12 +10,25 @@
 /* =================================================== */
 /* SIMULATION PARAMETERS                               */
 /* =================================================== */
-#define N_PARTICLES      1000000
+#define N_PARTICLES      100000000
 #define N_TIMESTEPS      100
 #define DT               0.1f
 #define PROCESS_NOISE    0.3f
 #define MEASUREMENT_NOISE 1.0f
 #define INIT_NOISE       0.5f
+
+/* =================================================== */
+/* CONSTANT MEMORY DECLARATIONS                        */
+/* =================================================== */
+__constant__ float c_dt = DT;
+__constant__ float c_process_noise = PROCESS_NOISE;
+__constant__ float c_measurement_noise = MEASUREMENT_NOISE;
+__constant__ int c_n_particles = N_PARTICLES;
+
+/* =================================================== */
+/* TEXTURE MEMORY DECLARATIONS                         */
+/* =================================================== */
+// Texture objects are now managed per-particle-filter instance
 
 /* =================================================== */
 /* CUDA OPTIMIZATION PARAMETERS                        */
